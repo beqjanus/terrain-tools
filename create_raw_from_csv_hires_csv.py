@@ -191,19 +191,68 @@ def downsample_grid_to_step_size(Z_hi, factor=FACTOR, method='nearest'):
         raise ValueError(f"Unknown downsampling method: {method}")
 
 def encode_height(h):
-    """Encode heights -> two 8‑bit channels R,G: height = R*G/128 +/- err (minimising err)"""
-    best = (0,0, float('inf'))
-    # avoid NaN
-    h = 0.0 if np.isnan(h) else h
-    for R in range(1,256):
+    # Fast path for zero height
+    if np.isnan(h) or h == 0.0:
+        return np.uint8(0), np.uint8(1)
+    best = (0, 0, float('inf'))
+    for R in range(255, 0, -1):  # Loop from 255 down to 1
         G = int(round(h * 128 / R))
         if 0 <= G < 256:
-            err = abs(R*G/128 - h)
-            if err < best[2]:
-                best = (R,G,err)
+            err = abs(R * G / 128 - h)
+            # Prefer lower G if error is the same
+            if err < best[2] or (err == best[2] and G < best[1]):
+                best = (R, G, err)
     return np.uint8(best[0]), np.uint8(best[1])
 
-# 9) Build the 13‑channel interleaved array
+def encode_height_quantized(h, quanta_per_m=64):
+    """
+    Encode height h into R,G bytes such that reconstructed height R*G/128
+    always falls on the 1/quanta_per_m grid by quantizing G channel.
+    """
+    # Fast path for zero height
+    if np.isnan(h) or h == 0.0:
+        return np.uint8(0), np.uint8(1)
+    
+    M = 128 // quanta_per_m  # G must be multiple of M, here 2 for quanta_per_m=64
+    best = (0, 0, float('inf'))
+    
+    for R in range(255, 0, -1):
+        G_ideal = h * 128 / R
+        G_round = int(round(G_ideal / M)) * M
+        if 0 <= G_round < 256:
+            err = abs(R * G_round / 128.0 - h)
+            # tie-break with lower G
+            if err < best[2] or (err == best[2] and G_round < best[1]):
+                best = (R, G_round, err)
+    
+    # Fallback to original if nothing found
+    if best[2] == float('inf'):
+        for R in range(255, 0, -1):
+            G = int(round(h * 128 / R))
+            err = abs(R * G / 128.0 - h)
+            if err < best[2] or (err == best[2] and G < best[1]):
+                best = (R, G, err)
+    
+    return np.uint8(best[0]), np.uint8(best[1])
+
+def create_blank_terrain(target_dim=TARGET_DIM):
+    # create a hi_res array of all zeroes ready for processing. Using this we can later increase the height to create arbitrary level fields
+    """Create a blank terrain grid of zeros."""
+    if target_dim <= 0:
+        raise ValueError("Target dimension must be positive")
+    return np.zeros((target_dim, target_dim), dtype=np.float32)
+
+def create_ramp_terrain(max_height, target_dim=TARGET_DIM):
+    """
+    Create a ramp terrain grid from height 0 (left, X=0) to max_height (right, X=max).
+    The ramp increases linearly along the X axis.
+    """
+    if target_dim <= 0:
+        raise ValueError("Target dimension must be positive")
+    # Each row is a linear ramp from 0 to max_height
+    ramp = np.linspace(0, max_height, target_dim, dtype=np.float32)
+    return np.tile(ramp, (target_dim, 1))
+
 def build_terrain_array(height_chan, height_unit_chan, water_byte, target_dim=TARGET_DIM):
     """Build the final 13-channel terrain array.
     Use Row major order:
@@ -228,7 +277,6 @@ def build_terrain_array(height_chan, height_unit_chan, water_byte, target_dim=TA
     out_arr = np.dstack((height_chan, height_unit_chan, water_channel, unused))
     return out_arr
 
-# 10) Write interleaved raw, no header
 def write_output_raw(out_arr, target_dim=TARGET_DIM):
     """Write the output raw file."""
     if out_arr.shape != (target_dim, target_dim, 13):
@@ -266,19 +314,23 @@ def main():
     --raw-out <output_file> (set the output raw file name, default is 'terrain.raw')
     --hi-res <hires_file> (set the input hires CSV file, default is 'highres.csv')
     --step <step> (set the step size in metres, default is 1.0)
+    --zero (create a blank terrain with all zeroes, combine with raise to create a flat terrain at a specified level)
+    --raise-by <N> (raise by N metres, negative raise will lower the terrain
     """
     import argparse
 
     parser = argparse.ArgumentParser(description="Create SL-style raw file from high-res CSV data.")
-    parser.add_argument('--quiet', action='store_true', help="Run without prompts")
+    parser.add_argument('-q', '--quiet', action='store_true', help="Run without prompts")
     parser.add_argument('--compare-with', type=str, help="Path to existing raw file for comparison")
     parser.add_argument('--no-plot', action='store_true', help="Do not plot error histogram")
-    parser.add_argument('--water-level', type=float, default=WATER_LEVEL, help="Set water level in metres")
-    parser.add_argument('--raw-out', type=str, default=RAW_OUTFILE, help="Output raw file name")
-    parser.add_argument('--hi-res', type=str, default=CSV_FILE, help="Input hires CSV file")
-    parser.add_argument('--step', type=float, default=STEP, help="Step size in metres, controls whether data will be averaged or not")
-    parser.add_argument('--raise-by', type=float, help="raise by N metres, negative raise will lower the terrain. bounds checking will be applied.")
-    
+    parser.add_argument('-w', '--water-level', type=float, default=WATER_LEVEL, help="Set water level in metres")
+    parser.add_argument('-o', '--raw-out', type=str, default=RAW_OUTFILE, help="Output raw file name")
+    parser.add_argument('-i', '--hi-res', type=str, default=CSV_FILE, help="Input hires CSV file")
+    parser.add_argument('-s', '--step', type=float, default=STEP, help="Step size in metres, controls whether data will be averaged or not")
+    parser.add_argument('-z', '--zero', action='store_true', help="Create a blank terrain with all zeroes, combine with raise-by to create a flat terrain at a specified level.")
+    parser.add_argument('-r', '--raise-by', type=float, help="raise by N metres, negative raise will lower the terrain. bounds checking will be applied.")
+    parser.add_argument('--ramp', type=float, help="Create a ramp terrain from 0 to N metres.")
+    parser.add_argument('--quanta', type=int, help="Quantize heights to 1/N metre steps (e.g. 64 for 1/64m). If set, uses quantized encoding.")
 
     # Set global variables based on arguments
     global args, region_name, resolution
@@ -293,29 +345,39 @@ def main():
         except ValueError:
             print("Invalid water level; using default.", file=sys.stderr)
             args.water_level = water_level
-
-    print_if_not_quiet(f"Using CSV file: {args.hi_res}")
+    if args.zero or args.ramp is not None:
+        print_if_not_quiet("Note: a generator (--zero, --ramp==N) specified, input data for hi-res iss ignored")
+    else:
+        print_if_not_quiet(f"Using CSV file: {args.hi_res}")
     print_if_not_quiet(f"Output raw file: {args.raw_out}")
     print_if_not_quiet(f"Step size: {args.step} metres")
     print_if_not_quiet(f"Water level: {args.water_level} metres")
 
-    region_name, resolution = read_csv_header(args.hi_res)
-    print_if_not_quiet(f"Region name: {region_name}, Resolution: {resolution}")
-    FACTOR = int(args.step / resolution) # thus resoltuion 0.25 and step one gives factor 4
+    if not args.zero and args.ramp is None:
+        region_name, resolution = read_csv_header(args.hi_res)
+        print_if_not_quiet(f"Region name: {region_name}, Resolution: {resolution}")
+        FACTOR = int(args.step / resolution) # thus resoltuion 0.25 and step one gives factor 4
 
-    # load and normalise the data
-    triples = load_hires_csv(args.hi_res)
-    triples = normalise_coordinates(triples)
+        # load and normalise the data
+        triples = load_hires_csv(args.hi_res)
+        triples = normalise_coordinates(triples)
 
-    # Build the high‑res grid
-    Z_hi = build_high_res_grid(triples, resolution)
-    # Report missing values
-    if report_missing(Z_hi):
-        sys.exit(1)
+        # Build the high‑res grid
+        Z_hi = build_high_res_grid(triples, resolution)
+        # Report missing values
+        if report_missing(Z_hi):
+            sys.exit(1)
 
-    # Downsample the grid (not dimension check is aginst the integer coord space not the index)
-    Z_hi_trimmed = check_dimensions_and_trim(Z_hi, target_dim=int(TARGET_DIM/resolution))
-    Z_ds = downsample_grid_to_step_size(Z_hi_trimmed, factor=FACTOR)
+        # Downsample the grid (not dimension check is aginst the integer coord space not the index)
+        Z_hi_trimmed = check_dimensions_and_trim(Z_hi, target_dim=int(TARGET_DIM/resolution))
+        Z_ds = downsample_grid_to_step_size(Z_hi_trimmed, factor=FACTOR)
+    elif args.ramp is not None:
+        ramp_height = args.ramp
+        print_if_not_quiet(f"Creating ramp terrain with height {ramp_height} metres upwards")
+        Z_ds = create_ramp_terrain(max_height=ramp_height, target_dim=TARGET_DIM)
+    else:
+        print_if_not_quiet("Creating blank terrain with all zeroes")
+        Z_ds = create_blank_terrain(target_dim=TARGET_DIM)
 
     if args.raise_by is not None:
         raise_by = args.raise_by
@@ -332,7 +394,13 @@ def main():
     
     water_byte = np.uint8(np.clip(int(round(args.water_level)), 0, 255))
 
-    vec = np.vectorize(encode_height, otypes=[np.uint8, np.uint8])
+    if args.quanta is not None:
+        print_if_not_quiet(f"Encoding heights with quantization: 1/{args.quanta} metre steps")
+        vec = np.vectorize(lambda h: encode_height_quantized(h, quanta_per_m=args.quanta), otypes=[np.uint8, np.uint8])
+    else:
+        vec = np.vectorize(encode_height, otypes=[np.uint8, np.uint8])
+
+    # vec = np.vectorize(encode_height, otypes=[np.uint8, np.uint8])
     height_chan, height_unit_chan = vec(Z_ds)
 
     out_arr = build_terrain_array(
