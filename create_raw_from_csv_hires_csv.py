@@ -192,7 +192,7 @@ def downsample_grid_to_step_size(Z_hi, factor=FACTOR, method='nearest'):
 
 def encode_height(h):
     # Fast path for zero height
-    if np.isnan(h) or h == 0.0:
+    if np.isnan(h) or np.isclose(h, 0.0):
         return np.uint8(0), np.uint8(1)
     best = (0, 0, float('inf'))
     for R in range(255, 0, -1):  # Loop from 255 down to 1
@@ -204,13 +204,26 @@ def encode_height(h):
                 best = (R, G, err)
     return np.uint8(best[0]), np.uint8(best[1])
 
+def encode_height_with_unit(h, height_unit=128):
+    # Fast path for zero height
+    if np.isnan(h) or np.isclose(h,0.0):
+        return np.uint8(0), np.uint8(1)
+    best = (0, 0, float('inf'))
+    for R in range(255, 0, -1):  # Loop from 255 down to 1
+        G = height_unit
+        if 0 <= G < 256:
+            err = abs(R * G / 128 - h)
+            if err < best[2]:
+                best = (R, G, err)
+    return np.uint8(best[0]), np.uint8(best[1])
+
 def encode_height_quantized(h, quanta_per_m=64):
     """
     Encode height h into R,G bytes such that reconstructed height R*G/128
     always falls on the 1/quanta_per_m grid by quantizing G channel.
     """
     # Fast path for zero height
-    if np.isnan(h) or h == 0.0:
+    if np.isnan(h) or np.isclose(h, 0.0):
         return np.uint8(0), np.uint8(1)
     
     M = 128 // quanta_per_m  # G must be multiple of M, here 2 for quanta_per_m=64
@@ -316,6 +329,9 @@ def main():
     --step <step> (set the step size in metres, default is 1.0)
     --zero (create a blank terrain with all zeroes, combine with raise to create a flat terrain at a specified level)
     --raise-by <N> (raise by N metres, negative raise will lower the terrain
+    --ramp <N> (create a ramp terrain from 0 to N metres)
+    --quanta <N> (quantize heights to 1/N metre steps, e.g. 64 for 1/64m, uses quantized encoding)
+    --with-unit <N> (quantize heights to N/128 metre steps, i.e specify the G value to use in encoding).
     """
     import argparse
 
@@ -331,6 +347,7 @@ def main():
     parser.add_argument('-r', '--raise-by', type=float, help="raise by N metres, negative raise will lower the terrain. bounds checking will be applied.")
     parser.add_argument('--ramp', type=float, help="Create a ramp terrain from 0 to N metres.")
     parser.add_argument('--quanta', type=int, help="Quantize heights to 1/N metre steps (e.g. 64 for 1/64m). If set, uses quantized encoding.")
+    parser.add_argument('--with-unit', type=int, help="Quantize heights to N/128 metre steps (i.e specify the G value to use in encoding).")
 
     # Set global variables based on arguments
     global args, region_name, resolution
@@ -397,6 +414,8 @@ def main():
     if args.quanta is not None:
         print_if_not_quiet(f"Encoding heights with quantization: 1/{args.quanta} metre steps")
         vec = np.vectorize(lambda h: encode_height_quantized(h, quanta_per_m=args.quanta), otypes=[np.uint8, np.uint8])
+    elif args.with_unit is not None:
+        vec = np.vectorize(lambda h: encode_height_with_unit(h, height_unit=args.with_unit), otypes=[np.uint8, np.uint8])
     else:
         vec = np.vectorize(encode_height, otypes=[np.uint8, np.uint8])
 
